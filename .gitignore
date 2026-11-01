@@ -1,0 +1,26 @@
+# CMake / CUDA build artifacts
+/build/
+/build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.so
+*.a
+*.exe
+
+# Raw profiler files are retained locally; curated experiment ZIPs are versioned.
+*.ncu-rep
+
+# Editor, Python and Windows download metadata
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*:Zone.Identifier
+.DS_Store
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
