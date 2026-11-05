@@ -23,6 +23,9 @@ add_executable(
     kernels/hgemm_v5_1.cu
     kernels/hgemm_v5_2.cu
     kernels/hgemm_v6.cu
+    kernels/hgemm_v6_1.cu
+    kernels/hgemm_v6_2.cu
+    kernels/hgemm_v6_3.cu
 )
 
 target_include_directories(

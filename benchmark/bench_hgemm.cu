@@ -144,17 +144,19 @@ void print_result(const std::string &name, float ms,
 namespace hgemm_validation
 {
 using Launch = void (*)(const half *, const half *, half *, int, int, int, cudaStream_t);
-Launch launches[] = {launch_hgemm_v4, launch_hgemm_v5, launch_hgemm_v5_1, launch_hgemm_v5_2, launch_hgemm_v6};
-const char *names[] = {"v4", "v5", "v5.1", "v5.2", "v6"};
+Launch launches[] = {launch_hgemm_v4, launch_hgemm_v5, launch_hgemm_v5_1, launch_hgemm_v5_2, launch_hgemm_v6, launch_hgemm_v6_1, launch_hgemm_v6_2, launch_hgemm_v6_3};
+const char *names[] = {"v4", "v5", "v5.1", "v5.2", "v6", "v6.1", "v6.2", "v6.3"};
 
 struct Matrix
 {
     int m, n, k;
     std::vector<half> a, b, c;
     half *da{}, *db{}, *dc{};
+    half *allocation_a{}, *allocation_b{};
+    int input_offset;
     cudaStream_t stream{};
-    Matrix(int M, int N, int K, int pattern)
-        : m(M), n(N), k(K), a(size_t(M) * K), b(size_t(K) * N), c(size_t(M) * N)
+    Matrix(int M, int N, int K, int pattern, int offset = 0)
+        : m(M), n(N), k(K), a(size_t(M) * K), b(size_t(K) * N), c(size_t(M) * N), input_offset(offset)
     {
         std::mt19937 rng(42 + pattern);
         std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
@@ -170,16 +172,20 @@ struct Matrix
         fill(a);
         fill(b);
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaMalloc(&da, a.size() * 2));
-        CUDA_CHECK(cudaMalloc(&db, b.size() * 2));
+        CUDA_CHECK(cudaMalloc(&allocation_a, (a.size() + offset) * sizeof(half)));
+        da = allocation_a + offset;
+        CUDA_CHECK(cudaMalloc(&allocation_b, (b.size() + offset) * sizeof(half)));
+        db = allocation_b + offset;
         CUDA_CHECK(cudaMalloc(&dc, c.size() * 2));
-        CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(db, b.data(), b.size() * 2, cudaMemcpyHostToDevice));
+        // 与后续 kernel 使用同一 nonblocking stream，显式建立 H2D -> kernel 顺序。
+        // Pageable cudaMemcpy 返回时 DMA 可能尚未完成，不能依赖默认 stream 隐式同步。
+        CUDA_CHECK(cudaMemcpyAsync(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(db, b.data(), b.size() * 2, cudaMemcpyHostToDevice, stream));
     }
     ~Matrix()
     {
-        CUDA_CHECK(cudaFree(da));
-        CUDA_CHECK(cudaFree(db));
+        CUDA_CHECK(cudaFree(allocation_a));
+        CUDA_CHECK(cudaFree(allocation_b));
         CUDA_CHECK(cudaFree(dc));
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
@@ -226,13 +232,13 @@ struct Matrix
         }
         std::cout << names[v] << "," << m << "," << n << "," << k << ",pattern=" << pattern
                   << ",path=" << ((v == 2 || v == 3) && ((n | k) & 1) ? "v5_scalar_fallback" : "native")
-                  << ",max_abs=" << maxerr << ",bad=" << bad << std::endl;
+                  << ",input_offset_half=" << input_offset << ",max_abs=" << maxerr << ",bad=" << bad << std::endl;
         return bad == 0;
     }
 };
 
 // Tensor Core 阶段：同一 stream、输入、输出类型，交错比较自写 kernel 与 cuBLAS。
-int benchmark_v6()
+int benchmark_v6(int experiment = 0)
 {
     Matrix x(1024, 1024, 1024, 0);
     cublasHandle_t handle;
@@ -241,7 +247,17 @@ int benchmark_v6()
     CUBLAS_CHECK(cublasSetStream(handle, x.stream));
 
     const char *labels[] = {"v4", "v5.2", "v6", "cuBLAS"};
-    const int versions[] = {0, 3, 4};
+    int versions[] = {0, 3, 4};
+    if (experiment == 1)
+    {
+        labels[0] = "v6"; labels[1] = "v6.1"; labels[2] = "v5.2";
+        versions[0] = 4; versions[1] = 5; versions[2] = 3;
+    }
+    if (experiment == 2)
+    {
+        labels[0] = "v6"; labels[1] = "v6.1"; labels[2] = "v6.2";
+        versions[0] = 4; versions[1] = 5; versions[2] = 6;
+    }
     auto launch = [&](int v) {
         if (v == 3)
             run_cublas(handle, x.da, x.db, x.dc, x.m, x.n, x.k);
@@ -281,43 +297,187 @@ int benchmark_v6()
     return 0;
 }
 
+// 多尺寸实验沿用默认 cuBLAS；计时前做精确 dyadic 对照及 CPU 抽样。
+int benchmark_sizes()
+{
+    const std::array<int, 3> shapes[] = {
+        {512, 512, 512}, {1024, 1024, 1024}, {2048, 2048, 2048}, {4096, 4096, 4096},
+        {512, 2048, 1024}, {2048, 512, 1024}, {1024, 1024, 64}, {1023, 1025, 1007}};
+    const int versions[] = {6, 7};
+    constexpr int count = sizeof(versions) / sizeof(int) + 1;
+    std::cout << "round,kernel,M,N,K,warmup,repeat,ms,tflops\n";
+    for (auto shape : shapes)
+    {
+        Matrix x(shape[0], shape[1], shape[2], 0);
+        cublasHandle_t handle;
+        CUBLAS_CHECK(cublasCreate(&handle));
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+        CUBLAS_CHECK(cublasSetStream(handle, x.stream));
+        auto launch = [&](int v) {
+            if (v == count - 1)
+                run_cublas(handle, x.da, x.db, x.dc, x.m, x.n, x.k);
+            else
+                x.run(versions[v]);
+        };
+        launch(count - 1);
+        CUDA_CHECK(cudaStreamSynchronize(x.stream));
+        std::vector<half> reference(x.c.size());
+        CUDA_CHECK(cudaMemcpy(reference.data(), x.dc, reference.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        bool ok = true;
+        for (int v = 0; v < count; ++v)
+        {
+            CUDA_CHECK(cudaMemsetAsync(x.dc, 0xff, x.c.size() * sizeof(half), x.stream));
+            launch(v);
+            CUDA_CHECK(cudaStreamSynchronize(x.stream));
+            CUDA_CHECK(cudaMemcpy(x.c.data(), x.dc, x.c.size() * sizeof(half), cudaMemcpyDeviceToHost));
+            size_t different = 0, cpu_bad = 0;
+            auto cpu_value = [&](size_t index) {
+                int row = index / x.n, col = index % x.n;
+                double ref = 0;
+                for (int k = 0; k < x.k; ++k)
+                    ref += double(__half2float(x.a[size_t(row) * x.k + k])) *
+                           double(__half2float(x.b[size_t(k) * x.n + col]));
+                return __half2float(__float2half_rn(float(ref)));
+            };
+            for (size_t i = 0; i < x.c.size(); ++i)
+            {
+                float got = __half2float(x.c[i]);
+                if (!std::isfinite(got))
+                    ++cpu_bad;
+                else if (got != __half2float(reference[i]))
+                {
+                    // 默认 cuBLAS 可能有中间舍入；不以逐位相同作为自写 kernel 的正确性定义。
+                    // 所有不同位置均由 CPU double 独立裁决，自写 dyadic 结果必须精确。
+                    ++different;
+                    if (got != cpu_value(i))
+                        ++cpu_bad;
+                }
+            }
+            // dyadic 输入在此 K 范围内 FP32 累加精确。抽样不能代替完整 CPU 测试。
+            std::mt19937 rng(63);
+            size_t sample_different = 0;
+            for (int sample = 0; sample < 256; ++sample)
+            {
+                int row = sample < 8 ? std::min(x.m - 1, sample == 7 ? x.m - 1 : sample * 16) : rng() % x.m;
+                int col = sample < 8 ? std::min(x.n - 1, sample == 7 ? x.n - 1 : sample * 16) : rng() % x.n;
+                size_t index = size_t(row) * x.n + col;
+                if (__half2float(x.c[index]) != cpu_value(index))
+                    ++sample_different;
+            }
+            std::cerr << "check," << (v == count - 1 ? "cuBLAS" : names[versions[v]])
+                      << ',' << x.m << ',' << x.n << ',' << x.k
+                      << ",full_cublas_different=" << different << ",cpu_bad=" << cpu_bad
+                      << ",cpu256_different=" << sample_different << '\n';
+            ok = ok && cpu_bad == 0 && (v == count - 1 || sample_different == 0);
+        }
+        if (!ok)
+        {
+            CUBLAS_CHECK(cublasDestroy(handle));
+            return 1;
+        }
+        // 大尺寸减少重复次数；同一尺寸各版本严格相同，CSV 记录实际次数。
+        const int repeat = std::max(10, std::min(200, int(200.0 * 1024 * 1024 * 1024 / (double(x.m) * x.n * x.k))));
+        for (int i = 0; i < 10 * repeat * count; ++i)
+            launch(i % count);
+        CUDA_CHECK(cudaStreamSynchronize(x.stream));
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        for (int round = 0; round < 12; ++round)
+            for (int position = 0; position < count; ++position)
+            {
+                int v = (position + round) % count;
+                for (int i = 0; i < 10; ++i)
+                    launch(v);
+                CUDA_CHECK(cudaEventRecord(start, x.stream));
+                for (int i = 0; i < repeat; ++i)
+                    launch(v);
+                CUDA_CHECK(cudaEventRecord(stop, x.stream));
+                CUDA_CHECK(cudaEventSynchronize(stop));
+                float ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+                ms /= repeat;
+                std::cout << round << ',' << (v == count - 1 ? "cuBLAS" : names[versions[v]])
+                          << ',' << x.m << ',' << x.n << ',' << x.k << ",10," << repeat << ',' << ms
+                          << ',' << 2.0 * x.m * x.n * x.k / (ms * 1e9) << std::endl;
+            }
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        CUBLAS_CHECK(cublasDestroy(handle));
+    }
+    return 0;
+}
+
 int run(int argc, char **argv)
 {
     std::string mode = std::string(argv[1]).substr(2);
-    if (argc != 2 && !(mode == "profile" && argc == 3))
+    if (argc != 2 && !(mode == "profile" && (argc == 3 || argc == 6)))
     {
         std::cerr << "Invalid argument count.\n";
         return 2;
     }
+    if (mode == "bench-sizes")
+        return benchmark_sizes();
+    if (mode == "bench-v6-2")
+        return benchmark_v6(2);
+    if (mode == "bench-v6-1")
+        return benchmark_v6(1);
     if (mode == "bench-v6")
         return benchmark_v6();
-    if (mode == "test" || mode == "test-large" || mode == "test-v6" || mode == "test-large-v6")
+    const int selected_test = (mode == "test-v6-3" || mode == "test-large-v6-3") ? 7
+                            : (mode == "test-v6-2" || mode == "test-large-v6-2") ? 6
+                            : (mode == "test-v6-1" || mode == "test-large-v6-1") ? 5
+                            : (mode == "test-v6" || mode == "test-large-v6") ? 4 : -1;
+    if (mode == "test" || mode == "test-large" || selected_test >= 0)
     {
         std::vector<std::array<int, 3>> shapes =
-            (mode == "test-large" || mode == "test-large-v6")
+            (mode.rfind("test-large", 0) == 0)
                 ? std::vector<std::array<int, 3>>{{1024, 1024, 1024}, {1023, 1025, 1007}}
                 : std::vector<std::array<int, 3>>{
                       {15, 17, 15}, {16, 16, 16}, {17, 15, 17}, {32, 32, 32}, {33, 31, 33},
                       {1, 1, 1},    {1, 2, 2},      {31, 33, 17},   {63, 62, 14}, {64, 64, 16},
                       {65, 66, 18}, {128, 128, 32}, {128, 128, 34}, {65, 66, 48}, {65, 66, 50},
                       {63, 65, 15}, {65, 63, 33},   {129, 130, 66}};
+        if (mode == "test-v6-2" || mode == "test-v6-3")
+            shapes.insert(shapes.end(), {{65, 72, 40}, {63, 64, 8}, {65, 72, 24}});
         bool ok = true;
         for (auto s : shapes)
             for (int p = 0; p < 3; ++p)
             {
-                Matrix x(s[0], s[1], s[2], p);
-                for (int v = (mode == "test-v6" || mode == "test-large-v6") ? 4 : 0; v < 5; ++v)
-                    ok = x.check(v, p) && ok;
+                const int offsets = (mode == "test-v6-2" || mode == "test-v6-3") ? 2 : 1;
+                for (int offset = 0; offset < offsets; ++offset)
+                {
+                    Matrix x(s[0], s[1], s[2], p, offset);
+                    for (int v = selected_test >= 0 ? selected_test : 0;
+                         v < (selected_test >= 0 ? selected_test + 1 : int(sizeof(launches) / sizeof(Launch))); ++v)
+                        ok = x.check(v, p) && ok;
+                }
             }
         return ok ? 0 : 1;
     }
-    if (mode == "profile" && argc == 3)
+    if (mode == "profile" && (argc == 3 || argc == 6))
     {
+        int m = 1024, n = 1024, k = 1024;
+        if (argc == 6)
+        {
+            int *dims[] = {&m, &n, &k};
+            for (int i = 0; i < 3; ++i)
+            {
+                char *end = nullptr;
+                long value = std::strtol(argv[i + 3], &end, 10);
+                if (*end != '\0' || value <= 0 || value > 16384)
+                {
+                    std::cerr << "Profile dimensions must be integers in [1, 16384].\n";
+                    return 2;
+                }
+                *dims[i] = int(value);
+            }
+        }
         std::string version = argv[2];
-        int v = version == "v4" ? 0 : version == "v5" ? 1 : version == "v5_1" ? 2 : version == "v5_2" ? 3 : version == "v6" ? 4 : -1;
+        int v = version == "v4" ? 0 : version == "v5" ? 1 : version == "v5_1" ? 2 : version == "v5_2" ? 3 : version == "v6" ? 4 : version == "v6_1" ? 5 : version == "v6_2" ? 6 : version == "v6_3" ? 7 : -1;
         if (version == "cublas")
         {
-            Matrix x(1024, 1024, 1024, 0);
+            Matrix x(m, n, k, 0);
             cublasHandle_t handle;
             CUBLAS_CHECK(cublasCreate(&handle));
             CUBLAS_CHECK(cublasSetStream(handle, x.stream));
@@ -328,10 +488,10 @@ int run(int argc, char **argv)
         }
         if (v < 0)
         {
-            std::cerr << "Kernel must be v4, v5, v5_1, v5_2, v6 or cublas.\n";
+            std::cerr << "Kernel must be v4, v5, v5_1, v5_2, v6, v6_1, v6_2, v6_3 or cublas.\n";
             return 2;
         }
-        Matrix x(1024, 1024, 1024, 0);
+        Matrix x(m, n, k, 0);
         x.run(v);
         CUDA_CHECK(cudaStreamSynchronize(x.stream));
         return 0;
@@ -339,8 +499,8 @@ int run(int argc, char **argv)
     if (mode != "bench-compare" && mode != "bench-steady" && mode != "bench-v5-2")
     {
         std::cerr << "Usage: bench_hgemm [M N K] | --test | --test-large | --bench-compare | "
-                     "--bench-steady | --bench-v5-2 | --bench-v6 | --test-v6 | --test-large-v6 | "
-                     "--profile v4/v5/v5_1/v5_2/v6/cublas\n";
+                     "--bench-steady | --bench-v5-2 | --bench-v6 | --bench-v6-1 | --bench-v6-2 | --bench-sizes | --test-v6[-1/-2/-3] | --test-large-v6[-1/-2/-3] | "
+                     "--profile v4/v5/v5_1/v5_2/v6/v6_1/v6_2/v6_3/cublas [M N K]\n";
         return 2;
     }
     Matrix x(1024, 1024, 1024, 0);
@@ -435,6 +595,9 @@ int main(int argc, char **argv)
     std::vector<half> hC_v5_1(sizeC);
     std::vector<half> hC_v5_2(sizeC);
     std::vector<half> hC_v6(sizeC);
+    std::vector<half> hC_v6_1(sizeC);
+    std::vector<half> hC_v6_2(sizeC);
+    std::vector<half> hC_v6_3(sizeC);
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
@@ -455,9 +618,15 @@ int main(int argc, char **argv)
     half *dC_v5_1 = nullptr;
     half *dC_v5_2 = nullptr;
     half *dC_v6 = nullptr;
+    half *dC_v6_1 = nullptr;
+    half *dC_v6_2 = nullptr;
+    half *dC_v6_3 = nullptr;
     CUDA_CHECK(cudaMalloc(&dC_v5_1, sizeC * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&dC_v5_2, sizeC * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&dC_v6, sizeC * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dC_v6_1, sizeC * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dC_v6_2, sizeC * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dC_v6_3, sizeC * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&dC_v5, sizeC * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&dC_v4, sizeC * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&dA, sizeA * sizeof(half)));
@@ -488,6 +657,9 @@ int main(int argc, char **argv)
     launch_hgemm_v5_1(dA, dB, dC_v5_1, M, N, K);
     launch_hgemm_v5_2(dA, dB, dC_v5_2, M, N, K);
     launch_hgemm_v6(dA, dB, dC_v6, M, N, K);
+    launch_hgemm_v6_1(dA, dB, dC_v6_1, M, N, K);
+    launch_hgemm_v6_2(dA, dB, dC_v6_2, M, N, K);
+    launch_hgemm_v6_3(dA, dB, dC_v6_3, M, N, K);
     run_cublas(handle, dA, dB, dC_ref, M, N, K);
 
     CUDA_CHECK(cudaGetLastError());
@@ -502,6 +674,9 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(hC_v5_1.data(), dC_v5_1, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(hC_v5_2.data(), dC_v5_2, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(hC_v6.data(), dC_v6, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hC_v6_1.data(), dC_v6_1, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hC_v6_2.data(), dC_v6_2, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hC_v6_3.data(), dC_v6_3, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(hC_ref.data(), dC_ref, sizeC * sizeof(half), cudaMemcpyDeviceToHost));
 
     std::cout << "Correctness\n";
@@ -514,9 +689,12 @@ int main(int argc, char **argv)
     bool pass_v5_1 = check_correctness("v5.1 double", hC_v5_1, hC_ref);
     bool pass_v5_2 = check_correctness("v5.2 bounds", hC_v5_2, hC_ref);
     bool pass_v6 = check_correctness("v6 WMMA", hC_v6, hC_ref);
+    bool pass_v6_1 = check_correctness("v6.1 pad", hC_v6_1, hC_ref);
+    bool pass_v6_2 = check_correctness("v6.2 vector", hC_v6_2, hC_ref);
+    bool pass_v6_3 = check_correctness("v6.3 reuse", hC_v6_3, hC_ref);
     std::cout << '\n';
 
-    if (!pass_v0 || !pass_v1 || !pass_v2 || !pass_v3 || !pass_v4 || !pass_v5 || !pass_v5_1 || !pass_v5_2 || !pass_v6)
+    if (!pass_v0 || !pass_v1 || !pass_v2 || !pass_v3 || !pass_v4 || !pass_v5 || !pass_v5_1 || !pass_v5_2 || !pass_v6 || !pass_v6_1 || !pass_v6_2 || !pass_v6_3)
     {
         std::cerr << "Correctness check failed. Benchmark aborted.\n";
         CUBLAS_CHECK(cublasDestroy(handle));
@@ -531,6 +709,9 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaFree(dC_v5_1));
         CUDA_CHECK(cudaFree(dC_v5_2));
         CUDA_CHECK(cudaFree(dC_v6));
+        CUDA_CHECK(cudaFree(dC_v6_1));
+        CUDA_CHECK(cudaFree(dC_v6_2));
+        CUDA_CHECK(cudaFree(dC_v6_3));
         CUDA_CHECK(cudaFree(dC_ref));
         return EXIT_FAILURE;
     }
@@ -557,6 +738,12 @@ int main(int argc, char **argv)
                               { launch_hgemm_v5_2(dA, dB, dC_v5_2, M, N, K); });
     float v6_ms = benchmark([&]()
                               { launch_hgemm_v6(dA, dB, dC_v6, M, N, K); });
+    float v6_1_ms = benchmark([&]()
+                              { launch_hgemm_v6_1(dA, dB, dC_v6_1, M, N, K); });
+    float v6_2_ms = benchmark([&]()
+                              { launch_hgemm_v6_2(dA, dB, dC_v6_2, M, N, K); });
+    float v6_3_ms = benchmark([&]()
+                              { launch_hgemm_v6_3(dA, dB, dC_v6_3, M, N, K); });
     float cublas_ms = benchmark([&]()
                                 { run_cublas(handle, dA, dB, dC_ref, M, N, K); });
 
@@ -579,6 +766,9 @@ int main(int argc, char **argv)
     print_result("v5.1 double", v5_1_ms, operations, cublas_ms);
     print_result("v5.2 bounds", v5_2_ms, operations, cublas_ms);
     print_result("v6 WMMA", v6_ms, operations, cublas_ms);
+    print_result("v6.1 pad", v6_1_ms, operations, cublas_ms);
+    print_result("v6.2 vector", v6_2_ms, operations, cublas_ms);
+    print_result("v6.3 reuse", v6_3_ms, operations, cublas_ms);
     print_result("cuBLAS", cublas_ms, operations, cublas_ms);
 
     std::cout << "\nv2 / v1 Speedup: " << v1_ms / v2_ms << "x\n";
@@ -605,6 +795,9 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaFree(dC_v5_1));
     CUDA_CHECK(cudaFree(dC_v5_2));
     CUDA_CHECK(cudaFree(dC_v6));
+    CUDA_CHECK(cudaFree(dC_v6_1));
+    CUDA_CHECK(cudaFree(dC_v6_2));
+    CUDA_CHECK(cudaFree(dC_v6_3));
     CUDA_CHECK(cudaFree(dC_ref));
 
     return 0;

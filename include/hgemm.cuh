@@ -38,3 +38,18 @@ void launch_hgemm_v6(
     int M, int N, int K,
     cudaStream_t stream = 0
 );
+
+void launch_hgemm_v6_1(
+    const half* A, const half* B, half* C,
+    int M, int N, int K, cudaStream_t stream = 0
+);
+
+void launch_hgemm_v6_2(
+    const half* A, const half* B, half* C,
+    int M, int N, int K, cudaStream_t stream = 0
+);
+
+void launch_hgemm_v6_3(
+    const half* A, const half* B, half* C,
+    int M, int N, int K, cudaStream_t stream = 0
+);
