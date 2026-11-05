@@ -9,7 +9,7 @@ CMakeCache.txt
 *.a
 *.exe
 
-# Raw profiler files are retained locally; curated experiment ZIPs are versioned.
+# Raw profiler reports are retained locally; readable results are versioned.
 *.ncu-rep
 
 # Editor, Python and Windows download metadata
@@ -24,3 +24,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Experiment results use readable Markdown/CSV, not archive packages.
+*.zip
